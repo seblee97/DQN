@@ -1,1 +1,1 @@
-source ../../VirtualEnvironments/hack_env/bin/activate
+source ../../VirtualEnvironments/dqntetris/bin/activate

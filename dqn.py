@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from torch import nn
 
 import gym
+import gym-tetris
+
 
 class QNetwork(nn.module):
 
