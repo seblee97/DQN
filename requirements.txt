@@ -2,3 +2,5 @@ gym==0.10.5
 torch
 numpy
 gym-tetris
+pygame
+ipython
