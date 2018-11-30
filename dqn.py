@@ -1,15 +1,21 @@
 import torch
-import numpy as np 
 import torch.nn.functional as F
 from torch import nn
-import random
-import PIL
 from torchvision import transforms
 from torch import optim
+
+import random
+import PIL
+import numpy as np 
 from collections import deque
+import os
 
 import gym
 import gym_tetris
+from gym import wrappers
+
+from tensorboardX import SummaryWriter
+writer = SummaryWriter()
 
 # Tetris action space: Discrete(12) no-action, left, right, down, rotate-left, rotate-right, left+down, 
 #                                   right+down, left+rotate-left, right+rotate-right, left+rotate-right, right+rotate-left
@@ -17,14 +23,17 @@ import gym_tetris
 config = {
     "env": gym_tetris.make('Tetris-v0'),
     "replay_buffer_size": 1000,
-    "epsilon": 0.05,
+    "final_epsilon": 0.01,
+    "epsilon_annealing_duration": 200000,
     "gamma": 0.95,
     "batch_size": 30,
     "processed_state_dims": (84, 84),
     "frame_skip": 4,
     "stack_dim": 4,
     "lr": 1e-2,
-    "momentum": 0.9
+    "momentum": 0.9,
+    "monitor": None, #"/tmp/tetris-results"
+    "exp_id": "test0"
 }
 
 def _array_to_image(rgb_state):
@@ -98,15 +107,23 @@ class DQN:
     def __init__(self, config):
         self.config = config 
 
-        self.epsilon = self.config["epsilon"]
+        self.epsilon = 1
+        self.final_epsilon = self.config["final_epsilon"]
+        self.epsilon_annealing_duration = self.config["epsilon_annealing_duration"]
+        self.epsilon_step = (self.epsilon - self.final_epsilon)/self.epsilon_annealing_duration
         self.gamma = self.config["gamma"]
         self.batch_size = self.config["batch_size"]
         self.frame_skip = self.config["frame_skip"]
         self.stack_dim = self.config["stack_dim"]
         self.lr = self.config["lr"]
 
+        self.exp_id = self.config["exp_id"]
         self.env = self.config["env"]
+        if self.config["monitor"] is not None:
+            self.env = wrappers.Monitor(self.env, os.getcwd() + self.config["monitor"])
         self.action_space = self.env.action_space
+        self.global_steps = 0
+        self.global_reward = 0
 
         self.processed_state_dims = self.config["processed_state_dims"]
         self.preprocessor = PreProcessor(self.processed_state_dims)
@@ -117,38 +134,58 @@ class DQN:
         self.replay_buffer = ReplayBuffer(self.replay_buffer_size)
 
     def train(self):
-        self.env.reset()
-        states = self._initialise_env()
-        print(states[0].shape)
-        for i in range(500):
-            if random.random() < self.epsilon:
-                act = self.action_space.sample()
-            else:
-                act = self.qnetwork.compute_actions(torch.stack(states, dim=1))
-            new_states = deque([states], maxlen=self.stack_dim)
-            rewards = deque([0 for _ in range(self.stack_dim)], maxlen=self.stack_dim)
-            for s in range(self.frame_skip - 1): #skip
-                new_state, reward, done, info = self._step_env(act)
-            new_states.append(self.preprocessor(new_state))
-            rewards.append(reward)
-            list_states = list(states)
-            list_new_states = list(new_states)
-            print(list_states, list_new_states)
-            experience = (torch.stack(list_states, dim=1), act, np.sum(rewards), torch.stack(list_new_states, dim=1))
-            self.replay_buffer.add(experience)
-            states = new_states
-            if i >= self.batch_size:
-                self._optimize()
+        for ep in range(20000):
+            ep_reward = 0
+            self.env.reset()
+            states, rewards = self._initialise_env()
+            new_states = states
+            done = False
+            while not done:
+                t = 0
+                if random.random() < self.epsilon:
+                    act = self.action_space.sample()
+                else:
+                    act = int(self.qnetwork.compute_actions(torch.stack(list(states), dim=1)))
+                for s in range(self.frame_skip - 1): #skip
+                    new_state, reward, done, info = self._step_env(act)
+                    if done:
+                        print("epsiode terminated with reward of {}".format(ep_reward))
+                        break
+                new_states.append(self.preprocessor(new_state))
+                rewards.append(reward)
+                ep_reward += reward
+                self.global_reward += reward
+                experience = (torch.stack(list(states), dim=1), act, np.sum(rewards), torch.stack(list(new_states), dim=1))
+                self.replay_buffer.add(experience)
+                states = new_states
+                t += 1
+                if t >= self.batch_size:
+                    self._optimize()
+                writer.add_scalar("data/global_reward", self.global_reward, self.global_steps) #log total reward to tb
+            # writer.add_scalar("data/episode_reward", ep_reward, ep+1) #log reward in this episode to tb
+            writer.add_scalar("data/mean_episode_reward", self.global_reward/(ep+1), self.global_steps) #log average episode reward to tb
+            # writer.add_scalar("data/mean_episode_track", ep, self.global_steps)
+        self.env.close()
+        #writer.export_scalars_to_json("./all_scalars.json")
+        writer.close()
     
     def _qloss(self, state, reward, action, new_state):
-        qval = self.qnetwork(state)[action]
-        y = reward + self.gamma*np.amax(self.q(new_state))
-        loss = F.smooth_l1_loss(qval, y)
+        qvalues = torch.stack([self.qnetwork(state)[i][action[i]] for i in range(len(action))])
+        y = torch.LongTensor(reward) + self.gamma*torch.stack([torch.max(r) for r in self.qnetwork(new_state)]).long()
+        loss = F.smooth_l1_loss(qvalues, y.float())
+        # writer.add_scalar("data/loss", loss, self.global_steps) #log loss to tb
         return loss
 
     def _optimize(self):
-        state, action, reward, new_state = self.replay_buffer.sample(batch_size) #the state & new state sampled here have been run through preprocessor and are stacked
-        loss = self._qloss(reward)
+        experience_sample = self.replay_buffer.sample(self.batch_size) #returns list of experience tuples
+        experience_sampleT = [list(r) for r in zip(*experience_sample)]
+        states = torch.stack(experience_sampleT[0], dim=1).squeeze()
+        new_states = torch.stack(experience_sampleT[3], dim=1).squeeze()
+        rewards = np.array(experience_sampleT[2])
+        actions = np.array(experience_sampleT[1])
+        loss = self._qloss(states, rewards, actions, new_states)
+        self.optimizer.zero_grad()
+        loss.backward()
         self.optimizer.step()
 
     def _step_env(self, action):
@@ -156,6 +193,10 @@ class DQN:
         query environment to collect new experience
         """
         state, reward, done, info = self.env.step(action)
+        self.global_steps += 1
+        if self.epsilon > self.final_epsilon:
+            self.epsilon -= self.epsilon_step
+        # writer.add_scalar("data/epsilon", self.global_steps) #log epsilon to tb
         return state, reward, done, info
 
     def _initialise_env(self):
@@ -163,16 +204,17 @@ class DQN:
         ensures first phi represents stack of four states
         """
         states = []
+        rewards = []
         for i in range(4):
-            states.append(self.preprocessor(self._step_env(self.env.action_space.sample())[0]))
-        return states
+            state, reward, a, b = self._step_env(self.env.action_space.sample())
+            states.append(self.preprocessor(state))
+            rewards.append(reward)
+        return deque(states, maxlen=self.stack_dim), deque(rewards, maxlen=self.stack_dim)
 
 class ReplayBuffer:
 
     def __init__(self, size):
-        self._buffer = []
-        self._size = size
-
+        self._buffer = deque([], maxlen=size)
 
     def add(self, experience):
         """
@@ -181,11 +223,7 @@ class ReplayBuffer:
         args:
             experience (tuple) -- (state, action, reward, next_state) 
         """
-        if len(self._buffer) < self._size:
-            self._buffer.append(experience)
-        else:
-            self._buffer.remove(random.choice(self._buffer))
-            self._buffer.append(experience)
+        self._buffer.append(experience)
 
     def sample(self, batch_size):
         """
@@ -197,8 +235,8 @@ class ReplayBuffer:
         returns"
             random experience (tuple) -- (state, action, reward, next_state) 
         """
-        return random.sample(self._buffer, batch_size)
+        return random.sample(list(self._buffer), batch_size)
 
-if __name__ == "__main__":
-    dqn = DQN(config)
-    dqn.train()
+# if __name__ == "__main__":
+#     dqn = DQN(config)
+#     dqn.train()
