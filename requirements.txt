@@ -4,3 +4,8 @@ numpy
 gym-tetris
 pygame
 ipython
+tensorboardX
+tensorflow
+tensorboard
+ipython
+PIL

@@ -26,14 +26,15 @@ config = {
     "final_epsilon": 0.01,
     "epsilon_annealing_duration": 200000,
     "gamma": 0.95,
-    "batch_size": 30,
+    "batch_size": 24,
     "processed_state_dims": (84, 84),
     "frame_skip": 4,
     "stack_dim": 4,
     "lr": 1e-2,
     "momentum": 0.9,
-    "monitor": None, #"/tmp/tetris-results"
-    "exp_id": "test0"
+    "monitor": None, #"/tmp/tetris-results",
+    "exp_id": "test0",
+    "living_reward": 0.001
 }
 
 def _array_to_image(rgb_state):
@@ -116,6 +117,7 @@ class DQN:
         self.frame_skip = self.config["frame_skip"]
         self.stack_dim = self.config["stack_dim"]
         self.lr = self.config["lr"]
+        self.living_reward = self.config["living_reward"]
 
         self.exp_id = self.config["exp_id"]
         self.env = self.config["env"]
@@ -140,8 +142,8 @@ class DQN:
             states, rewards = self._initialise_env()
             new_states = states
             done = False
+            t = 0
             while not done:
-                t = 0
                 if random.random() < self.epsilon:
                     act = self.action_space.sample()
                 else:
@@ -162,9 +164,9 @@ class DQN:
                 if t >= self.batch_size:
                     self._optimize()
                 writer.add_scalar("data/global_reward", self.global_reward, self.global_steps) #log total reward to tb
-            # writer.add_scalar("data/episode_reward", ep_reward, ep+1) #log reward in this episode to tb
+            writer.add_scalar("data/episode_reward", ep_reward, ep+1) #log reward in this episode to tb
             writer.add_scalar("data/mean_episode_reward", self.global_reward/(ep+1), self.global_steps) #log average episode reward to tb
-            # writer.add_scalar("data/mean_episode_track", ep, self.global_steps)
+            writer.add_scalar("data/mean_episode_track", ep, self.global_steps)
         self.env.close()
         #writer.export_scalars_to_json("./all_scalars.json")
         writer.close()
@@ -173,7 +175,8 @@ class DQN:
         qvalues = torch.stack([self.qnetwork(state)[i][action[i]] for i in range(len(action))])
         y = torch.LongTensor(reward) + self.gamma*torch.stack([torch.max(r) for r in self.qnetwork(new_state)]).long()
         loss = F.smooth_l1_loss(qvalues, y.float())
-        # writer.add_scalar("data/loss", loss, self.global_steps) #log loss to tb
+        # print('loss', loss)
+        writer.add_scalar("data/loss", loss, self.global_steps) #log loss to tb
         return loss
 
     def _optimize(self):
@@ -193,10 +196,11 @@ class DQN:
         query environment to collect new experience
         """
         state, reward, done, info = self.env.step(action)
+        reward += self.living_reward
         self.global_steps += 1
         if self.epsilon > self.final_epsilon:
             self.epsilon -= self.epsilon_step
-        # writer.add_scalar("data/epsilon", self.global_steps) #log epsilon to tb
+        writer.add_scalar("data/epsilon", self.epsilon, self.global_steps) #log epsilon to tb
         return state, reward, done, info
 
     def _initialise_env(self):
@@ -237,6 +241,6 @@ class ReplayBuffer:
         """
         return random.sample(list(self._buffer), batch_size)
 
-# if __name__ == "__main__":
-#     dqn = DQN(config)
-#     dqn.train()
+if __name__ == "__main__":
+    dqn = DQN(config)
+    dqn.train()
