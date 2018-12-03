@@ -18,6 +18,13 @@ from gym import wrappers
 from tensorboardX import SummaryWriter
 writer = SummaryWriter()
 
+if torch.cuda.is_available():
+    print("Using the GPU")
+    experiment_device = torch.device("cuda")
+else:
+    print("Using the CPU")
+    experiment_device = torch.device("cpu")
+
 # Tetris action space: Discrete(12) no-action, left, right, down, rotate-left, rotate-right, left+down, 
 #                                   right+down, left+rotate-left, right+rotate-right, left+rotate-right, right+rotate-left
 
@@ -85,6 +92,7 @@ class PreProcessor(nn.Module):
     def forward(self, state):
         pil = _array_to_image(state)
         processed_state = self.transform(pil)
+        processed_state = processed_state.to(experiment_device)
         return processed_state
 
 class QNetwork(nn.Module):
@@ -146,8 +154,8 @@ class DQN:
         self.global_reward = 0
 
         self.processed_state_dims = self.config["processed_state_dims"]
-        self.preprocessor = PreProcessor(self.processed_state_dims)
-        self.qnetwork = QNetwork(num_actions=self.env.action_space.n)
+        self.preprocessor = PreProcessor(self.processed_state_dims).to(experiment_device)
+        self.qnetwork = QNetwork(num_actions=self.env.action_space.n).to(experiment_device)
         self.optimizer = optim.Adam(self.qnetwork.parameters(), lr=self.lr)
         
         self.replay_buffer_size = self.config["replay_buffer_size"]
@@ -196,9 +204,9 @@ class DQN:
     def _qloss(self, state, reward, action, new_state, done=False):
         qvalues = torch.stack([self.qnetwork(state)[i][action[i]] for i in range(len(action))])
         if done:
-            y = torch.LongTensor(reward) 
+            y = torch.LongTensor(reward).to(torch.device("cuda"))
         else:
-            y = torch.LongTensor(reward) + self.gamma*torch.stack([torch.max(r) for r in self.qnetwork(new_state)]).long()
+            y = torch.LongTensor(reward).to(experiment_device) + self.gamma*torch.stack([torch.max(r) for r in self.qnetwork(new_state)]).long()
         loss = F.smooth_l1_loss(qvalues, y.float())
         # print('loss', loss)
         writer.add_scalar("data/loss", loss, self.global_steps) #log loss to tb
