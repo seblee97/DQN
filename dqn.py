@@ -28,10 +28,12 @@ else:
 # Tetris action space: Discrete(12) no-action, left, right, down, rotate-left, rotate-right, left+down, 
 #                                   right+down, left+rotate-left, right+rotate-right, left+rotate-right, right+rotate-left
 
-environments = {0: gym_tetris.make('Tetris-v0'), 1: gym.make('MsPacman-v0'), 2: gym.make('Breakout-v0')}
+#CartPole HyperParameters: python dqn_new.py -c 500 --final_eps 0.1 --eps_anneal 10000 --replay_start_size 3000 --gamma 1 --lr 1e-4 -fs 1 -sd 1 -bs 100000 -b 20
+
+environments = {0: gym_tetris.make('Tetris-v0'), 1: gym.make('MsPacman-v0'), 2: gym.make('Breakout-v0'), 3: gym.make('Pong-v0'), 4: gym.make('CartPole-v0')}
 
 parser = argparse.ArgumentParser(description='DQN Configuration')
-parser.add_argument('-e', '--env', default=2, type=int, 
+parser.add_argument('-e', '--env', default=3, type=int, 
                     help='Index of environments dictionary to specify gym environment')
 parser.add_argument('-bs', '--buffer_size', default=1000000, type=int, 
                     help='Size of experience replay buffer')
@@ -82,7 +84,6 @@ def trial_env():
     env.close()
     return env
 
-
 class PreProcessor(nn.Module):
 
     """
@@ -106,58 +107,44 @@ class PreProcessor(nn.Module):
 class QNetwork(nn.Module):
 
     """
-    Target network introduced to stabilise training
+    Architecture taken from original DQN paper
     """
 
-    def __init__(self, obs_space=((4,84,84)), num_actions=12):
+    def __init__(self, obs_space=((4,84,84)), num_actions=12, symbolic=False):
         nn.Module.__init__(self)
         self.obs_space = obs_space
         self.num_actions = num_actions
+        self.symbolic = symbolic
+
+        #Visual Layers
         self.conv1 = nn.Conv2d(self.obs_space[0], out_channels=16, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(16, out_channels=32, kernel_size=4, stride=2)
         self.lin = nn.Linear(32*9*9, self.num_actions)
 
+        #Symbolic Layers
+        self.fc1 = nn.Linear(self.obs_space[0], 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, self.num_actions)
 
     def forward(self, obs):
-        x = F.relu(self.conv1(obs))
-        x = F.relu(self.conv2(x))
-        x = x.view((x.shape[0], -1))
-        x = self.lin(x)
+        if self.symbolic:
+            obs = obs.float()
+            x = F.relu(self.fc1(obs))
+            x = F.relu(self.fc2(x))
+            x = self.fc3(x)
+        else:
+            x = F.relu(self.conv1(obs))
+            x = F.relu(self.conv2(x))
+            x = x.view((x.shape[0], -1))
+            x = self.lin(x)
         return x
 
     def compute_actions(self, obs):
-        actions = self.forward(obs)[0]
-        act, arg = actions.detach().max(0)
+        actions = self.forward(obs)
+        if not self.symbolic:
+            actions = actions[0]
+        act, arg = actions.detach()[0].max(0)
         return arg
-
-
-class QTarget(nn.Module):
-
-    """
-    Target network introduced to stabilise training
-    """
-
-    def __init__(self, obs_space=((4,84,84)), num_actions=12):
-        nn.Module.__init__(self)
-        self.obs_space = obs_space
-        self.num_actions = num_actions
-        self.conv1 = nn.Conv2d(self.obs_space[0], out_channels=16, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(16, out_channels=32, kernel_size=4, stride=2)
-        self.lin = nn.Linear(32*9*9, self.num_actions)
-
-
-    def forward(self, obs):
-        x = F.relu(self.conv1(obs))
-        x = F.relu(self.conv2(x))
-        x = x.view((x.shape[0], -1))
-        x = self.lin(x)
-        return x
-
-    def compute_actions(self, obs):
-        actions = self.forward(obs)[0]
-        act, arg = actions.detach().max(0)
-        return arg
-
 
 class DQN:
 
@@ -187,83 +174,102 @@ class DQN:
         self.action_space = self.env.action_space
         self.global_steps = 0
         self.global_reward = 0
+        self.symbolic = self.config["symbolic"]
 
         self.processed_state_dims = self.config["processed_state_dims"]
         self.preprocessor = PreProcessor(self.processed_state_dims).to(experiment_device)
-        self.qnetwork = QNetwork(num_actions=self.env.action_space.n).to(experiment_device)
+        self.qnetwork = QNetwork(num_actions=self.env.action_space.n, symbolic=self.symbolic).to(experiment_device)
         if self.target:
-            self.qtarget = QTarget(num_actions=self.env.action_space.n).to(experiment_device)
+            self.qtarget = QNetwork(num_actions=self.env.action_space.n, symbolic=self.symbolic).to(experiment_device)
+            self.qtarget.load_state_dict(self.qnetwork.state_dict()) #initialise target network with same weights as qnetwork
+            self.update_target = False
         self.optimizer = optim.Adam(self.qnetwork.parameters(), lr=self.lr)
         
         self.replay_buffer_size = self.config["replay_buffer_size"]
         self.replay_buffer = ReplayBuffer(self.replay_buffer_size)
 
     def train(self):
+        print('sym', self.symbolic)
+        self.env.reset()
         for ep in range(self.num_eps):
-            ep_reward = 0
             self.env.reset()
-            states, rewards = self._initialise_env()
-            new_states = states
+            states, ep_reward = self._initialise_env()
+            new_states = states.copy()
             done = False
-            t = 0
             while not done:
                 if random.random() < self.epsilon:
                     act = self.action_space.sample()
                 else:
-                    act = int(self.qnetwork.compute_actions(torch.stack([self.preprocessor(s) for s in list(states)], dim=1)))
-                for s in range(self.frame_skip - 1): #skip
+                    if self.symbolic:
+                        act = int(self.qnetwork.compute_actions(torch.stack([torch.tensor(s) for s in list(states)])))
+                    else:
+                        preprocessed_state = torch.stack([self.preprocessor(s) for s in list(states)], dim=1)
+                        act = int(self.qnetwork.compute_actions(preprocessed_state))
+                r = 0
+                for _f in range(self.frame_skip): #skip
                     if not done:
                         new_state, reward, done, info = self._step_env(act)
-                new_states.append(new_state.astype('uint8'))
-                rewards.append(reward)
-                if done:
-                    print('final reward', reward)
-                ep_reward += reward
-                self.global_reward += reward
-                #experience = (torch.stack(list(states), dim=1), act, np.sum(rewards), torch.stack(list(new_states), dim=1))
-                experience = (states, act, np.sum(rewards), new_states)
+                        r += reward
+                        ep_reward += reward
+                        self.global_reward += reward
+                if self.symbolic:
+                    new_states.append(new_state)
+                else:
+                    new_states.append(new_state.astype('uint8'))
+                experience = (states, act, np.clip(np.sum(r), -1, 1), new_states, done) #clipping rewards to between -1 and 1
                 self.replay_buffer.add(experience)
-                states = new_states
-                t += 1
+                states = new_states.copy()
                 if self.global_steps >= self.replay_start:
+                    self._optimize()
                     if done:
-                        self._optimize(done=True)
                         print("epsiode terminated with reward of {}".format(ep_reward))
-                    else:
-                        self._optimize(done=False)
                 writer.add_scalar("data/global_reward", self.global_reward, self.global_steps) #log total reward to tb
             writer.add_scalar("data/episode_reward", ep_reward, ep+1) #log reward in this episode to tb
             writer.add_scalar("data/mean_episode_reward", self.global_reward/(ep+1), self.global_steps) #log average episode reward to tb
             writer.add_scalar("data/mean_episode_track", ep, self.global_steps)
         self.env.close()
         writer.close()
-    
-    def _qloss(self, state, reward, action, new_state, done=False):
-        qvalues = torch.stack([self.qnetwork(state)[i][action[i]] for i in range(len(action))])
-        if done:
-            y = torch.LongTensor(reward).to(experiment_device)
+
+    def _qloss(self, state, reward, action, new_state, dones):
+        qnv = self.qnetwork(state)
+        if self.target:
+            qv = self.qtarget(new_state)
         else:
-            if self.target:
-                y = torch.LongTensor(reward).to(experiment_device) + self.gamma*torch.stack([torch.max(r) for r in self.qtarget(new_state)]).long()
-            else:
-                y = torch.LongTensor(reward).to(experiment_device) + self.gamma*torch.stack([torch.max(r) for r in self.qnetwork(new_state)]).long()
-        loss = F.smooth_l1_loss(qvalues, y.float())
+            qv = self.qnetwork(new_state)
+        if self.symbolic:
+            qnvalues = torch.stack([qnv[i][0][action[i]] for i in range(len(action))])
+            y = (torch.FloatTensor(reward).to(experiment_device) + self.gamma*dones.float()*torch.stack([torch.max(qv[i][0]) for i in range(len(action))]).float()).detach().to(experiment_device)
+        else:
+            qnvalues = torch.stack([qnv[i][action[i]] for i in range(len(action))])
+            y = (torch.FloatTensor(reward).to(experiment_device) + self.gamma*dones.float()*torch.stack([torch.max(qv[i]) for i in range(len(action))]).float()).detach()
+        loss = F.smooth_l1_loss(qnvalues, y)
         writer.add_scalar("data/loss", loss, self.global_steps) #log loss to tb
         return loss
 
-    def _optimize(self, done=False):
+
+    def _optimize(self):
         experience_sample = self.replay_buffer.sample(self.batch_size) #returns list of experience tuples
-        experience_sampleT = [list(r) for r in zip(*experience_sample)]
-        states = torch.stack([torch.stack([self.preprocessor(s) for s in list(d)], dim=1) for d in experience_sampleT[0]], dim=1).squeeze()
-        new_states = torch.stack([torch.stack([self.preprocessor(s) for s in list(d)], dim=1) for d in experience_sampleT[3]], dim=1).squeeze()
-        rewards = np.array(experience_sampleT[2])
-        actions = np.array(experience_sampleT[1])
-        loss = self._qloss(states, rewards, actions, new_states, done=done)
+        experience_sampleT = np.array(experience_sample).T
+        if self.symbolic:
+            states = torch.stack([torch.tensor(list(s)) for s in list(experience_sampleT[0])]).to(experiment_device)
+            new_states = torch.stack([torch.tensor(list(s)) for s in list(experience_sampleT[3])]).to(experiment_device)
+        else:
+            preprocessed_individual_states = [torch.stack([self.preprocessor(s) for s in list(d)], dim=1) for d in experience_sampleT[0]]
+            states = torch.stack(preprocessed_individual_states, dim=1).squeeze().to(experiment_device)
+            preprocessed_new_individual_states = [torch.stack([self.preprocessor(s) for s in list(d)], dim=1) for d in experience_sampleT[3]]
+            new_states = torch.stack(preprocessed_new_individual_states, dim=1).squeeze().to(experiment_device)
+        rewards = np.array(experience_sampleT[2], dtype=float)
+        actions = np.array(experience_sampleT[1], dtype=int)
+        dones = torch.from_numpy(np.ones(len(actions), dtype=float) - np.array(experience_sampleT[4], dtype=float)).to(experiment_device)
+        loss = self._qloss(states, rewards, actions, new_states, dones)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        if self.target and self.global_steps%self.C == 0:
-            self.qtarget = self.qnetwork #reset target network to q network
+        if self.update_target:
+            print('--------------Target Network Updated', self.global_steps)
+            self.qtarget.load_state_dict(self.qnetwork.state_dict()) #reset target network to q network
+            self.update_target = False
+
 
     def _step_env(self, action):
         """
@@ -272,6 +278,8 @@ class DQN:
         state, reward, done, info = self.env.step(action)
         reward += self.living_reward
         self.global_steps += 1
+        if self.global_steps%self.C == 0:
+            self.update_target = True
         if self.epsilon > self.final_epsilon and self.global_steps > self.replay_start:
             self.epsilon -= self.epsilon_step
         writer.add_scalar("data/epsilon", self.epsilon, self.global_steps) #log epsilon to tb
@@ -282,12 +290,16 @@ class DQN:
         ensures first phi represents stack of four states
         """
         states = []
-        rewards = []
-        for i in range(4):
+        rewards = 0
+        for i in range(self.stack_dim):
             state, reward, a, b = self._step_env(self.env.action_space.sample())
-            states.append(state.astype('uint8'))
-            rewards.append(reward)
-        return deque(states, maxlen=self.stack_dim), deque(rewards, maxlen=self.stack_dim)
+            if self.symbolic:
+                states.append(state)
+            else:
+                states.append(state.astype('uint8'))
+            rewards += reward
+        return deque(states, maxlen=self.stack_dim), rewards
+
 
 class ReplayBuffer:
 
@@ -299,7 +311,7 @@ class ReplayBuffer:
         method to add experiences to the replay buffer
 
         args:
-            experience (tuple) -- (state, action, reward, next_state) 
+            experience (tuple) -- (state, action, reward, next_state)
         """
         self._buffer.append(experience)
 
@@ -319,6 +331,7 @@ def run():
     args = parser.parse_args()
     if args.replay_start_size < args.batch_size:
         raise ValueError("Initial experience gathering must exceed batch size in order for samples to be drawn from buffer during training")
+    symbolic = args.env == 4
     config = {
         "env": environments[args.env],
         "replay_buffer_size": args.buffer_size,
@@ -337,13 +350,12 @@ def run():
         "C": args.C,
         "target": args.target,
         "replay_start_size": args.replay_start_size,
-        "num_episodes": args.num_episodes
+        "num_episodes": args.num_episodes,
+        "symbolic": symbolic
     }
     dqn = DQN(config)
     dqn.train()
 
-
 if __name__ == "__main__":
     run()
-    
     
