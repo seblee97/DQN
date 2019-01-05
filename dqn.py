@@ -74,10 +74,13 @@ parser.add_argument('-n', '--num_episodes', default=20000, type=int,
 def _array_to_image(rgb_state):
     return PIL.Image.fromarray(rgb_state)
 
-def trial_env():
-    env = gym_tetris.make('Tetris-v0')
+def trial_env(env_index, steps):
+    """
+    function to test environment
+    """
+    env = environments[env_index]
     done=True
-    for step in range(5000):
+    for step in range(steps):
         if done:
             state=env.reset()
         state, reward, done, info = env.step(env.action_space.sample())
@@ -107,10 +110,10 @@ class PreProcessor(nn.Module):
 class QNetwork(nn.Module):
 
     """
-    Architecture taken from original DQN paper
+    Architecture taken from original DQN paper https://www.nature.com/articles/nature14236
     """
 
-    def __init__(self, obs_space=((4,84,84)), num_actions=12, symbolic=False):
+    def __init__(self, obs_space=((4,84,84)), num_actions=4, symbolic=False):
         nn.Module.__init__(self)
         self.obs_space = obs_space
         self.num_actions = num_actions
@@ -162,7 +165,7 @@ class DQN:
         self.lr = self.config["lr"]
         self.momentum = self.config["momentum"]
         self.living_reward = self.config["living_reward"]
-        self.C = self.config["C"]
+        self.sync_networks = self.config["C"]
         self.target = self.config["target"]
         self.replay_start = self.config["replay_start_size"]
         self.num_eps = self.config["num_episodes"]
@@ -190,7 +193,6 @@ class DQN:
 
     def train(self):
         print('sym', self.symbolic)
-        self.env.reset()
         for ep in range(self.num_eps):
             self.env.reset()
             states, ep_reward = self._initialise_env()
@@ -278,7 +280,7 @@ class DQN:
         state, reward, done, info = self.env.step(action)
         reward += self.living_reward
         self.global_steps += 1
-        if self.global_steps%self.C == 0:
+        if self.global_steps%self.sync_networks == 0:
             self.update_target = True
         if self.epsilon > self.final_epsilon and self.global_steps > self.replay_start:
             self.epsilon -= self.epsilon_step
@@ -347,7 +349,7 @@ def run():
         "monitor": args.monitor,
         "exp_id": args.exp_id,
         "living_reward": args.living_rew,
-        "C": args.C,
+        "sync_networks": args.C,
         "target": args.target,
         "replay_start_size": args.replay_start_size,
         "num_episodes": args.num_episodes,
